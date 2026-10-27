@@ -6,11 +6,13 @@ Stdlib only, so it runs anywhere python3 does.
 """
 
 import argparse
+import grp
 import hashlib
 import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -18,10 +20,12 @@ import sys
 import tempfile
 import textwrap
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.0"
+VERSION = "2.1"
+SCHEMA_VERSION = 1
 API_URL = "https://gtfobins.org/api.json"
 DATA_DIR = os.environ.get("ESCABIN_HOME") or os.path.join(
     os.path.expanduser("~"), ".local", "share", "escabin"
@@ -29,6 +33,16 @@ DATA_DIR = os.environ.get("ESCABIN_HOME") or os.path.join(
 API_PATH = os.path.join(DATA_DIR, "api.json")
 
 SEVERITY = {"critical": 0, "high": 1, "medium": 2}
+CONFIDENCE = {"high": 0, "medium": 1, "low": 2}
+EXIT_ERROR = 1
+EXIT_FINDINGS = 3
+MAX_DOWNLOAD = 8 * 1024 * 1024
+HTTP_TIMEOUT = 30
+FIND_TIMEOUT_FAST = 120
+FIND_TIMEOUT_FULL = 900
+CAP_TIMEOUT = 180
+SUDO_TIMEOUT = 20
+SUDO_ASK_TIMEOUT = 300
 FUNC_ORDER = [
     "shell", "command", "reverse-shell", "bind-shell", "privilege-escalation",
     "file-write", "file-read", "library-load", "upload", "download", "list",
@@ -41,8 +55,22 @@ TOOL_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 PRUNE_FULL = [
     "/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker",
-    "/System/Volumes", "/Volumes", "/private/var/vm",
+    "/var/lib/containers", "/var/lib/lxcfs", "/var/lib/kubelet",
+    "/var/lib/nfs/rpc_pipefs", "/System/Volumes", "/Volumes",
+    "/private/var/vm", "/net",
 ]
+NETWORK_FS = {
+    "9p", "afs", "ceph", "cifs", "davfs", "fuse.rclone", "fuse.sshfs",
+    "glusterfs", "lustre", "ncpfs", "nfs", "nfs4", "smbfs", "sshfs",
+}
+# SGID grants this group's access, not root; these groups are effectively privileged.
+PRIVILEGED_GROUPS = {"root", "wheel", "admin", "shadow", "disk", "docker", "lxd", "sudo"}
+RUNAS_NAME = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*$")
+SUDO_TAGS = {
+    "EXEC", "NOEXEC", "FOLLOW", "NOFOLLOW", "LOG_INPUT", "NOLOG_INPUT",
+    "LOG_OUTPUT", "NOLOG_OUTPUT", "MAIL", "NOMAIL", "INTERCEPT",
+    "NOINTERCEPT", "PASSWD", "NOPASSWD", "SETENV", "NOSETENV",
+}
 
 TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -76,8 +104,21 @@ def green(t):
 
 
 def die(msg):
-    print(f"escabin: {msg}", file=sys.stderr)
-    sys.exit(1)
+    print(f"escabin: {safe_text(msg)}", file=sys.stderr)
+    sys.exit(EXIT_ERROR)
+
+
+_UNSAFE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\ud800-\udfff]"
+)
+
+
+def safe_text(value):
+    """Make system-provided text safe for a terminal (control chars/ANSI/bidi)."""
+    def repl(match):
+        code = ord(match.group(0))
+        return f"\\x{code:02x}" if code <= 0xff else f"\\u{code:04x}"
+    return _UNSAFE.sub(repl, str(value))
 
 
 def clean_md(text):
@@ -97,42 +138,164 @@ def system_tool(name):
 
 # ---------------------------------------------------------------- data
 
-def download():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    req = urllib.request.Request(API_URL, headers={"User-Agent": f"escabin/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read()
-    data = json.loads(raw)  # refuse to cache garbage
-    if not all(k in data for k in ("executables", "functions", "contexts")):
-        raise ValueError("unexpected API shape")
+def _type_name(value):
+    return type(value).__name__
+
+
+def _check_str_list(value, where):
+    if isinstance(value, str):
+        return
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return
+    raise ValueError(f"{where} must be a string or a list of strings")
+
+
+def validate_api(data):
+    """Reject malformed data before it can replace a working cache."""
+    if not isinstance(data, dict):
+        raise ValueError("top level must be a JSON object")
+    for key in ("executables", "functions", "contexts"):
+        if key not in data:
+            raise ValueError(f"missing {key!r}")
+        if not isinstance(data[key], dict):
+            raise ValueError(f"{key!r} must be an object, got {_type_name(data[key])}")
+    if not data["executables"]:
+        raise ValueError("'executables' is empty")
+
+    for name, entry in data["executables"].items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("executable names must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise ValueError(f"executables[{name!r}] must be an object")
+        alias = entry.get("alias")
+        if alias is not None:
+            _check_str_list(alias, f"executables[{name!r}].alias")
+        if entry.get("comment") is not None and not isinstance(entry["comment"], str):
+            raise ValueError(f"executables[{name!r}].comment must be a string")
+        funcs = entry.get("functions")
+        if funcs is None:
+            continue
+        if not isinstance(funcs, dict):
+            raise ValueError(f"executables[{name!r}].functions must be an object")
+        for func, items in funcs.items():
+            if not isinstance(func, str) or not isinstance(items, list):
+                raise ValueError(f"executables[{name!r}].functions[{func!r}] must be a list")
+            for index, item in enumerate(items):
+                where = f"executables[{name!r}].functions[{func!r}][{index}]"
+                if not isinstance(item, dict):
+                    raise ValueError(f"{where} must be an object")
+                if item.get("code") is not None and not isinstance(item["code"], str):
+                    raise ValueError(f"{where}.code must be a string")
+                if item.get("comment") is not None and not isinstance(item["comment"], str):
+                    raise ValueError(f"{where}.comment must be a string")
+                contexts = item.get("contexts")
+                if contexts is None:
+                    continue
+                if not isinstance(contexts, dict):
+                    raise ValueError(f"{where}.contexts must be an object")
+                for ctx, override in contexts.items():
+                    if not isinstance(ctx, str):
+                        raise ValueError(f"{where}.contexts keys must be strings")
+                    if override is None:
+                        continue
+                    if not isinstance(override, dict):
+                        raise ValueError(f"{where}.contexts[{ctx!r}] must be an object or null")
+                    if override.get("code") is not None and not isinstance(override["code"], str):
+                        raise ValueError(f"{where}.contexts[{ctx!r}].code must be a string")
+                    if override.get("list") is not None:
+                        _check_str_list(override["list"], f"{where}.contexts[{ctx!r}].list")
+
+    for func, entry in data["functions"].items():
+        if not isinstance(func, str) or not isinstance(entry, dict):
+            raise ValueError("'functions' values must be objects")
+        if entry.get("label") is not None and not isinstance(entry["label"], str):
+            raise ValueError(f"functions[{func!r}].label must be a string")
+    for ctx, entry in data["contexts"].items():
+        if not isinstance(ctx, str) or not isinstance(entry, dict):
+            raise ValueError("'contexts' values must be objects")
+
+
+def _read_limited(resp):
+    headers = getattr(resp, "headers", None)
+    length = headers.get("Content-Length") if headers else None
+    if length:
+        try:
+            declared = int(length)
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > MAX_DOWNLOAD:
+            raise ValueError(f"response is larger than {MAX_DOWNLOAD} bytes")
+    chunks = []
+    total = 0
+    while True:
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_DOWNLOAD:
+            raise ValueError(f"response is larger than {MAX_DOWNLOAD} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def download(path=None, url=API_URL):
+    """Download and validate data, then atomically replace the cache."""
+    path = path or API_PATH
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": f"escabin/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = _read_limited(resp)
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"HTTP {exc.code} from {url}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"cannot reach {url}: {exc.reason}") from exc
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError) and "larger than" in str(exc):
+            raise
+        raise ValueError(f"download failed: {exc}") from exc
+    if not raw:
+        raise ValueError("empty response")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"invalid JSON: {exc}") from exc
+    validate_api(data)
+
     digest = hashlib.sha256(raw).hexdigest()
-    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".api.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".api.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
-        os.replace(tmp, API_PATH)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
     return len(raw), digest
 
 
-def load_api(refresh=False):
+def load_api(refresh=False, path=None):
+    path = path or API_PATH
     if refresh:
         try:
-            size, digest = download()
-        except Exception as exc:
-            die(f"update failed: {exc}")
-        print(f"updated {API_PATH} ({size / 1024:.0f} KiB, sha256 {digest})")
-    if not os.path.exists(API_PATH):
+            size, digest = download(path=path)
+        except (ValueError, OSError) as exc:
+            die(f"update failed: {exc}; existing cache left unchanged")
+        print(f"updated {safe_text(path)} ({size / 1024:.0f} KiB, sha256 {digest})")
+    if not os.path.exists(path):
         try:
-            download()
-        except Exception as exc:
+            download(path=path)
+        except (ValueError, OSError) as exc:
             die(f"no local data and download failed: {exc}")
-    with open(API_PATH, encoding="utf-8") as fh:
-        data = json.load(fh)
-    if not all(k in data for k in ("executables", "functions", "contexts")):
-        die("corrupt data file, run: escabin update")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        validate_api(data)
+    except (OSError, ValueError, RecursionError) as exc:
+        die(f"cannot use data file {path}: {exc}; run: escabin update")
     return data
 
 
@@ -198,7 +361,8 @@ SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!",
 def rewrite_commands(code, binary, path, prefix=""):
     """Rewrite every command-position use of `binary` to `path`, optionally sudo-prefixed."""
     names = {binary, os.path.basename(path)}
-    return "\n".join(_rewrite_line(line, names, path, prefix)
+    target = shlex.quote(path)
+    return "\n".join(_rewrite_line(line, names, target, prefix)
                      for line in (code or "").splitlines())
 
 
@@ -270,7 +434,7 @@ def _rewrite_line(line, names, path, prefix):
 
 def print_code(code, indent="    "):
     for line in (code or "").rstrip().splitlines():
-        print(indent + line)
+        print(indent + safe_text(line))
 
 
 # ---------------------------------------------------------------- commands
@@ -280,34 +444,35 @@ def cmd_show(db, ref):
     if not key:
         die(f"'{ref}' not in GTFOBins (try: escabin search {ref})")
     entry = db.ex[key]
-    print(bold(key))
+    print(bold(safe_text(key)))
     if entry.get("alias"):
         alias = entry["alias"]
-        print(dim("alias: " + (alias if isinstance(alias, str) else ", ".join(alias))))
+        print(dim("alias: " + safe_text(alias if isinstance(alias, str) else ", ".join(alias))))
     if entry.get("comment"):
-        print(textwrap.fill(clean_md(entry["comment"]), 96))
+        print(safe_text(textwrap.fill(clean_md(entry["comment"]), 96)))
     funcs = db.funcs(key)
     if not funcs:
         print("no functions documented (alias only)")
         return
     for fname in db.ordered(funcs):
         print()
-        print(bold(db.label(fname)))
+        print(bold(safe_text(db.label(fname))))
         for item in funcs[fname]:
-            print("  " + cyan(" ".join(f"[{c}]" for c in (item.get("contexts") or {}))))
+            contexts = " ".join(f"[{c}]" for c in (item.get("contexts") or {}))
+            print("  " + cyan(safe_text(contexts)))
             base = item.get("code")
             print_code(base, "    ")
             for ctx, over in (item.get("contexts") or {}).items():
                 if isinstance(over, dict) and over.get("code") and over["code"] != base:
-                    print(dim(f"    {ctx}:"))
+                    print(dim(f"    {safe_text(ctx)}:"))
                     print_code(over["code"], "      ")
             caps = context_caps(item, "capabilities")
             if caps:
-                print(dim("    needs: " + ", ".join(caps)))
+                print(dim("    needs: " + safe_text(", ".join(caps))))
             if item.get("comment"):
-                print(dim(textwrap.fill(clean_md(item["comment"]), 96,
-                                        initial_indent="    # ",
-                                        subsequent_indent="    # ")))
+                print(dim(safe_text(textwrap.fill(clean_md(item["comment"]), 96,
+                                                  initial_indent="    # ",
+                                                  subsequent_indent="    # "))))
 
 
 def cmd_search(db, term, limit):
@@ -324,11 +489,11 @@ def cmd_search(db, term, limit):
         if needle in name.lower() or matched:
             rows.append((name, db.ordered(set(matched))))
     if not rows:
-        print(f"no match for '{term}'")
+        print(safe_text(f"no match for '{term}'"))
         return
     for name, funcs in rows[:limit]:
         detail = ", ".join(db.label(f).lower() for f in funcs) if funcs else "name match"
-        print(f"{bold(name.ljust(26))} {dim(detail)}")
+        print(f"{bold(safe_text(name.ljust(26)))} {dim(safe_text(detail))}")
     if len(rows) > limit:
         print(dim(f"... {len(rows) - limit} more (raise -n)"))
 
@@ -351,70 +516,269 @@ def fast_roots():
     ]
 
 
-def scan_suid(full):
+def _timeout_output(exc):
+    out = exc.stdout or ""
+    if isinstance(out, bytes):
+        out = out.decode(errors="surrogateescape")
+    return out
+
+
+def _first_line(text, limit=200):
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:limit]
+    return ""
+
+
+def network_mounts(path="/proc/self/mounts"):
+    """Mount points of network filesystems, so --full does not hang on them."""
+    found = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3 or parts[2] not in NETWORK_FS:
+                    continue
+                mount = (parts[1].replace("\\040", " ").replace("\\011", "\t")
+                         .replace("\\134", "\\"))
+                if mount != "/":
+                    found.append(mount)
+    except OSError:
+        pass
+    return found
+
+
+def _dedupe_paths(paths):
+    unique = {}
+    for path in sorted(paths):
+        try:
+            key = os.path.realpath(path)
+        except OSError:
+            key = path
+        previous = unique.get(key)
+        if previous is None:
+            unique[key] = path
+            continue
+        try:
+            if (stat.S_ISLNK(os.lstat(previous).st_mode)
+                    and not stat.S_ISLNK(os.lstat(path).st_mode)):
+                unique[key] = path
+        except OSError:
+            pass
+    return set(unique.values())
+
+
+def scan_privileged(full):
+    """Find SUID and SGID regular files without following symlinks.
+
+    One find traversal covers both bits. Returns partial results on timeout.
+    """
     find = system_tool("find")
+    result = {"suid": set(), "sgid": set(), "status": "complete",
+              "reason": None, "complete": True}
     if not find:
-        die("find not found; cannot scan for SUID binaries")
-    roots = ["/"] if full else fast_roots()
-    prune = PRUNE_FULL if full else []
+        result.update(status="unavailable", reason="find not installed", complete=False)
+        return result
+
+    roots = [root for root in (["/"] if full else fast_roots()) if os.path.isdir(root)]
+    if not roots:
+        result.update(status="unavailable", reason="no scan roots exist", complete=False)
+        return result
+    prune = list(PRUNE_FULL) if full else []
+    if full:
+        prune.extend(network_mounts())
+    timeout = FIND_TIMEOUT_FULL if full else FIND_TIMEOUT_FAST
 
     def one(root):
         args = [find, root]
-        for p in prune:
-            args += ["-path", p, "-prune", "-o"]
-        args += ["-type", "f", "-perm", "-4000", "-print"]
+        for path in prune:
+            args += ["-path", path, "-prune", "-o"]
+        args += ["-type", "f", "(", "-perm", "-4000", "-o", "-perm", "-2000",
+                 ")", "-print0"]
         try:
             proc = subprocess.run(args, capture_output=True, text=True,
-                                  timeout=900 if full else 120, errors="replace")
-            return proc.stdout.splitlines(), True
+                                  timeout=timeout, errors="surrogateescape")
         except subprocess.TimeoutExpired as exc:
-            print(f"escabin: warning: scanning {root} timed out, results incomplete",
-                  file=sys.stderr)
-            out = exc.stdout or ""
-            if isinstance(out, bytes):
-                out = out.decode(errors="replace")
-            return out.splitlines(), False
-        except OSError:
-            return [], False
+            return (_timeout_output(exc).split("\0"), "partial",
+                    f"{root}: timed out after {timeout}s")
+        except OSError as exc:
+            return [], "failed", f"{root}: {exc}"
+        lines = [line for line in (proc.stdout or "").split("\0") if line]
+        if proc.returncode != 0:
+            reason = f"{root}: {_first_line(proc.stderr) or f'find exited {proc.returncode}'}"
+            return lines, ("partial" if lines else "failed"), reason
+        return lines, "complete", None
 
     paths = set()
-    complete = True
+    statuses = []
+    reasons = []
     workers = min(8, max(1, len(roots)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for found, ok in pool.map(one, roots):
+        for found, status, reason in pool.map(one, roots):
             paths.update(found)
-            complete = complete and ok
-    return paths, complete
+            statuses.append(status)
+            if reason:
+                reasons.append(reason)
+
+    paths = _dedupe_paths(paths)
+    stat_errors = 0
+    for path in paths:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            stat_errors += 1
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_mode & stat.S_ISUID:
+            result["suid"].add(path)
+        if st.st_mode & stat.S_ISGID:
+            result["sgid"].add(path)
+
+    if "failed" in statuses:
+        status = "failed" if not paths else "partial"
+    elif "partial" in statuses:
+        status = "partial"
+    else:
+        status = "complete"
+    if stat_errors:
+        if status == "complete":
+            status = "partial"
+        reasons.append(f"could not stat {stat_errors} result(s)")
+    if status != "complete":
+        result["status"] = status
+        result["reason"] = "; ".join(dict.fromkeys(reasons)) or "scan did not complete"
+        result["complete"] = False
+    return result
+
+
+def parse_getcap(out):
+    caps = {}
+    for line in (out or "").splitlines():
+        parts = line.strip().rsplit(None, 1)
+        if len(parts) != 2:
+            continue
+        path, attrs = parts
+        if not path or "=" not in attrs:
+            continue
+        names = attrs.split("=", 1)[0]
+        caps[path] = {name for name in names.split(",") if name}
+        if not caps[path]:
+            del caps[path]
+    return caps
 
 
 def scan_caps():
     exe = system_tool("getcap")
     if not exe:
-        return {}, "getcap not installed"
+        return {"caps": {}, "status": "unavailable",
+                "reason": "getcap not installed", "checked": False}
     try:
         proc = subprocess.run([exe, "-r", "/"], capture_output=True, text=True,
-                              timeout=180, errors="replace")
-    except subprocess.TimeoutExpired:
-        return {}, "getcap timed out, not checked"
+                              timeout=CAP_TIMEOUT, errors="surrogateescape")
+    except subprocess.TimeoutExpired as exc:
+        caps = parse_getcap(_timeout_output(exc))
+        return {"caps": caps, "status": "partial" if caps else "failed",
+                "reason": "getcap timed out; results incomplete", "checked": False}
     except OSError as exc:
-        return {}, f"getcap failed: {exc}"
-    caps = {}
-    for line in proc.stdout.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2:
+        return {"caps": {}, "status": "failed",
+                "reason": f"getcap failed: {exc}", "checked": False}
+    caps = parse_getcap(proc.stdout)
+    if proc.returncode != 0:
+        reason = _first_line(proc.stderr) or f"getcap exited {proc.returncode}"
+        return {"caps": caps, "status": "partial" if caps else "failed",
+                "reason": reason, "checked": False}
+    return {"caps": caps, "status": "complete", "reason": None, "checked": True}
+
+
+def _split_specs(text):
+    """Split a sudo Cmnd_Spec_List on commas outside quotes and a leading runas."""
+    specs = []
+    buf = []
+    quote = None
+    runas_depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            buf.append(ch)
+            buf.append(text[i + 1])
+            i += 2
             continue
-        path, attrs = parts
-        caps[path] = set(re.split(r"[=+]", attrs)[0].split(","))
-    return caps, None
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if runas_depth:
+            buf.append(ch)
+            if ch == "(":
+                runas_depth += 1
+            elif ch == ")":
+                runas_depth -= 1
+            i += 1
+            continue
+        if ch == "(" and not "".join(buf).strip():
+            runas_depth = 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            specs.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    specs.append("".join(buf))
+    return specs
+
+
+def _split_command(text):
+    """Split a sudo command spec into path and the exact argument tail."""
+    out = []
+    quote = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if ch in " \t":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out), text[i:].strip()
 
 
 def parse_sudo(out):
     chunks = []
-    for raw in out.splitlines():
+    for raw in (out or "").splitlines():
         line = raw.strip()
+        if not line:
+            continue
         if line.startswith("("):
             chunks.append(line)
-        elif line and chunks and raw[:1] in (" ", "\t"):
+        elif chunks and raw[:1] in (" ", "\t"):
             chunks[-1] += " " + line
 
     rules = []
@@ -422,61 +786,93 @@ def parse_sudo(out):
         parsed = re.match(r"\(([^)]*)\)\s*(.*)", chunk)
         if not parsed:
             continue
-        runas, body = parsed.groups()
+        runas, body = parsed.group(1).strip(), parsed.group(2)
         nopasswd = False
-        for entry in re.split(r",\s*", body):
-            entry = entry.strip()
-            if not entry:
+        for raw_spec in _split_specs(body):
+            spec = raw_spec.strip()
+            if not spec:
                 continue
-            override = re.match(r"\(([^)]*)\)\s*(.*)", entry)
+            override = re.match(r"\(([^)]*)\)\s*(.*)", spec)
             if override:
-                runas, entry = override.groups()
+                runas, spec = override.group(1).strip(), override.group(2).strip()
+            original = spec
             while True:
-                tag = re.match(r"([A-Z_]+):\s*(.*)", entry)
+                tag = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", spec)
                 if not tag:
                     break
-                if tag.group(1) == "NOPASSWD":
+                name = tag.group(1).upper()
+                if name not in SUDO_TAGS:
+                    break
+                if name == "NOPASSWD":
                     nopasswd = True
-                elif tag.group(1) == "PASSWD":
+                elif name == "PASSWD":
                     nopasswd = False
-                entry = tag.group(2)
-            if not entry:
+                spec = tag.group(2).strip()
+            if not spec or spec.startswith("!"):
                 continue
-            if entry.upper() == "ALL":
-                rules.append({"all": True, "runas": runas, "nopasswd": nopasswd, "raw": chunk})
-            elif entry.startswith("/"):
-                path = entry.split()[0]
-                rules.append({"all": False, "path": path, "args": entry[len(path):].strip(),
-                              "runas": runas, "nopasswd": nopasswd, "raw": chunk})
+            permitted = spec
+            common = {"runas": runas, "nopasswd": nopasswd, "raw": chunk,
+                      "spec": original, "permitted": permitted}
+            if spec.upper() == "ALL":
+                rules.append(dict(common, all=True, path=None, args="", manual=False))
+                continue
+            manual = False
+            reason = ""
+            path = None
+            args = ""
+            if spec.startswith("/"):
+                path, args = _split_command(spec)
+                if not path:
+                    manual, reason = True, "empty command path"
+                elif "*" in path or "?" in path or "[" in path:
+                    manual, reason = True, "wildcard command path"
+                elif path.endswith("/"):
+                    manual, reason = True, "directory command path"
+            else:
+                manual, reason = True, "unrecognised sudo command specification"
+            rules.append(dict(common, all=False, path=path, args=args,
+                              manual=manual, reason=reason))
     return rules
 
 
 def scan_sudo(ask=False):
     exe = system_tool("sudo")
     if not exe:
-        return {"ok": False, "rules": [], "error": "sudo not installed"}
+        return {"ok": False, "rules": [], "error": "sudo not installed",
+                "status": "unavailable"}
     args = [exe, "-l"] if ask else [exe, "-n", "-l"]
     try:
         if ask:
             proc = subprocess.run(args, stdout=subprocess.PIPE, text=True,
-                                  timeout=300, errors="replace")
+                                  timeout=SUDO_ASK_TIMEOUT, errors="surrogateescape")
         else:
             proc = subprocess.run(args, capture_output=True, text=True,
-                                  timeout=20, errors="replace")
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return {"ok": False, "rules": [], "error": f"sudo -l failed: {exc}"}
+                                  timeout=SUDO_TIMEOUT, errors="surrogateescape")
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rules": [],
+                "error": "sudo -l timed out", "status": "failed"}
+    except OSError as exc:
+        return {"ok": False, "rules": [],
+                "error": f"sudo -l failed: {exc}", "status": "failed"}
     out = proc.stdout or ""
-    if not ask:
-        out += proc.stderr or ""
     if proc.returncode != 0:
-        if not ask and "password" in out.lower():
-            err = "a password is required (rerun with --ask-sudo)"
-        elif not ask:
-            err = "not permitted"
+        combined = (out + "\n" + (proc.stderr or "")).lower()
+        if not ask and any(word in combined for word in
+                           ("password", "askpass", "no tty", "terminal is required")):
+            error = "a password is required (rerun with --ask-sudo)"
+            status = "skipped"
+        elif any(word in combined for word in
+                 ("not permitted", "not allowed", "may not run sudo")):
+            error = "not permitted"
+            status = "skipped"
         else:
-            err = f"sudo -l failed (exit {proc.returncode})"
-        return {"ok": False, "rules": [], "error": f"sudo: {err}"}
-    return {"ok": True, "rules": parse_sudo(out), "error": None}
+            error = f"sudo -l failed (exit {proc.returncode})"
+            detail = _first_line(proc.stderr)
+            if detail:
+                error += f": {detail}"
+            status = "failed"
+        return {"ok": False, "rules": [], "error": f"sudo: {error}", "status": status}
+    return {"ok": True, "rules": parse_sudo(out), "error": None, "status": "complete"}
 
 
 def matching(db, path, ctx, have_caps=None):
@@ -500,179 +896,578 @@ def matching(db, path, ctx, have_caps=None):
     return key, out
 
 
+def runas_users(runas):
+    users = str(runas or "root").split(":", 1)[0]
+    return [user.strip() for user in users.split(",") if user.strip()]
+
+
 def runas_user(rule):
-    return (rule.get("runas") or "root").split(":")[0].strip() or "root"
+    users = runas_users(rule.get("runas"))
+    return users[0] if users else ""
 
 
-def is_root_runas(user):
-    return user.upper() == "ALL" or user == "root"
+def is_root_runas(runas):
+    spec = str(runas or "root").split(":", 1)[0]
+    return any(user.strip().upper() == "ALL" or user.strip() == "root"
+               for user in spec.split(",") if user.strip())
 
 
 def writable_by_us(st_mode, euid, can_write):
-    # root passes access(W_OK) for everything, so only mode bits are meaningful there
-    return bool(st_mode & 0o022) or (euid != 0 and can_write)
+    # os.access() is true for root on almost everything, so when running as
+    # root use group/other write bits: they mean some account could replace it.
+    if euid == 0:
+        return bool(st_mode & 0o022)
+    return bool(can_write)
 
 
-def cmd_check(db, full, as_json, ask_sudo=False):
+def make_finding(severity, vector, title, detail, confidence, evidence,
+                 command=None, functions=None, manual_review=False):
+    if severity not in SEVERITY:
+        raise ValueError(f"bad severity: {severity}")
+    if confidence not in CONFIDENCE:
+        raise ValueError(f"bad confidence: {confidence}")
+    return {
+        "severity": severity,
+        "confidence": confidence,
+        "exploitability": "unverified",
+        "vector": vector,
+        "title": title,
+        "detail": detail,
+        "command": command,
+        "functions": functions or [],
+        "manual_review": bool(manual_review),
+        "evidence": evidence,
+    }
+
+
+def check_exit_code(findings, fail_on):
+    if not fail_on:
+        return 0
+    threshold = SEVERITY[fail_on]
+    return EXIT_FINDINGS if any(SEVERITY[f["severity"]] <= threshold
+                                for f in findings) else 0
+
+
+def _id_name(table, ident, fallback):
+    try:
+        return table(ident)
+    except (KeyError, OSError):
+        return str(fallback)
+
+
+def file_evidence(path, st, check, complete, **extra):
+    evidence = {
+        "check": check,
+        "path": path,
+        "owner": _id_name(lambda uid: pwd.getpwuid(uid).pw_name, st.st_uid, st.st_uid),
+        "group": _id_name(lambda gid: grp.getgrgid(gid).gr_name, st.st_gid, st.st_gid),
+        "mode": format(stat.S_IMODE(st.st_mode), "04o"),
+        "setuid": bool(st.st_mode & stat.S_ISUID),
+        "setgid": bool(st.st_mode & stat.S_ISGID),
+        "scan_complete": complete,
+    }
+    evidence.update(extra)
+    return evidence
+
+
+def sudo_prefix(rule):
+    """Return (prefix, is_root, manual_runas)."""
+    raw = rule.get("runas") or "root"
+    if is_root_runas(raw):
+        return "sudo ", True, False
+    users = runas_users(raw)
+    if not users or any(not RUNAS_NAME.match(user) for user in users):
+        return "", False, True
+    return f"sudo -u {shlex.quote(users[0])} ", False, False
+
+
+def sudo_evidence(rule, complete, **extra):
+    evidence = {
+        "check": "sudo",
+        "path": rule.get("path"),
+        "sudo_rule": {
+            "raw": rule.get("raw"),
+            "spec": rule.get("spec"),
+            "permitted": rule.get("permitted"),
+            "runas": rule.get("runas") or "root",
+            "nopasswd": bool(rule.get("nopasswd")),
+            "arguments": rule.get("args", ""),
+        },
+        "scan_complete": complete,
+    }
+    evidence.update(extra)
+    return evidence
+
+
+def evidence_summary(finding):
+    e = finding["evidence"]
+    parts = []
+    if e.get("path"):
+        parts.append("path=" + str(e["path"]))
+    for key in ("owner", "group"):
+        if e.get(key):
+            parts.append(f"{key}={e[key]}")
+    if e.get("mode"):
+        parts.append("mode=" + str(e["mode"]))
+    for key in ("setuid", "setgid", "writable"):
+        if key in e:
+            parts.append(f"{key}={'yes' if e[key] else 'no'}")
+    if e.get("capabilities"):
+        parts.append("caps=" + ",".join(e["capabilities"]))
+    if e.get("sudo_rule"):
+        rule = e["sudo_rule"]
+        parts.append("runas=" + str(rule.get("runas")))
+        parts.append("nopasswd=" + ("yes" if rule.get("nopasswd") else "no"))
+        if rule.get("arguments"):
+            parts.append("args=" + str(rule["arguments"]))
+        parts.append("rule=" + str(rule.get("spec") or rule.get("raw")))
+    if e.get("functions"):
+        parts.append("gtfobins=" + ",".join(e["functions"]))
+    if e.get("scan_complete") is not None:
+        parts.append("scan=" + ("complete" if e["scan_complete"] else "incomplete"))
+    return "  ".join(parts)
+
+
+def coverage_summary(coverage):
+    parts = []
+    for name, check in coverage["checks"].items():
+        text = f"{name} {check['status']}"
+        if check["status"] in ("complete", "partial"):
+            text += f" ({check['count']})"
+        parts.append(text)
+    return "; ".join(parts)
+
+
+def cmd_check(db, full, as_json, ask_sudo=False, fail_on=None):
     started = time.time()
     notes = []
     findings = []
+    linux = sys.platform.startswith("linux")
 
-    sudo = scan_sudo(ask_sudo)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        sudo_future = pool.submit(scan_sudo, ask_sudo)
+        privileged_future = pool.submit(scan_privileged, full)
+        caps_future = pool.submit(scan_caps) if linux else None
+        sudo = sudo_future.result()
+        privileged = privileged_future.result()
+        if caps_future:
+            caps = caps_future.result()
+        else:
+            caps = {"caps": {}, "status": "unsupported",
+                    "reason": "not supported on this platform", "checked": False}
+
+    suid = privileged["suid"]
+    sgid = privileged["sgid"]
+    suid_complete = privileged["status"] == "complete"
+    cap_status = caps["status"]
+    cap_reason = caps["reason"]
+    cap_stat_errors = 0
+
     if not sudo["ok"]:
         notes.append(sudo["error"])
     seen_rules = set()
     for rule in sudo["rules"]:
+        prefix, root, manual_runas = sudo_prefix(rule)
         user = runas_user(rule)
-        root = is_root_runas(user)
-        prefix = "sudo " if root else f"sudo -u {user} "
-        if rule["all"]:
-            findings.append({
-                "severity": "critical" if root else "high",
-                "vector": "sudo",
-                "title": "sudo: unrestricted" if root else f"sudo as {user}: unrestricted",
-                "detail": rule["raw"],
-                "command": "sudo -i" if root else f"sudo -u {user} -i",
-                "functions": [],
+
+        if rule.get("all"):
+            dedupe = ("all", rule.get("runas"), rule.get("nopasswd"))
+            if dedupe in seen_rules:
+                continue
+            seen_rules.add(dedupe)
+            if root:
+                severity, title = "critical", "sudo: unrestricted"
+            elif manual_runas:
+                severity = "medium"
+                title = f"sudo as {rule.get('runas')}: unrestricted (manual review)"
+            else:
+                severity, title = "high", f"sudo as {user}: unrestricted"
+            limitations = ("Based on sudo -l output; aliases, includes and policy details "
+                           "were not re-parsed. The rule was not executed.")
+            finding = make_finding(
+                severity, "sudo", title, "sudo rule: " + rule.get("raw", ""), "high",
+                sudo_evidence(rule, sudo["status"] == "complete", functions=[]),
+                command=(prefix + "-i") if prefix else None,
+                manual_review=manual_runas,
+            )
+            finding["evidence"].update({
+                "risk": ("The rule permits any command with the run-as privileges."
+                         if not manual_runas else "The run-as specification needs manual review."),
+                "limitations": limitations,
+                "remediation": ("Restrict the rule to required commands and users; "
+                                "avoid unrestricted ALL; review sudoers changes."),
             })
+            findings.append(finding)
             continue
-        dedupe = (rule["path"], rule["args"], rule["nopasswd"], user)
+
+        dedupe = (rule.get("path"), rule.get("args"), rule.get("nopasswd"),
+                  rule.get("runas"), rule.get("manual"), rule.get("permitted"))
         if dedupe in seen_rules:
             continue
         seen_rules.add(dedupe)
-        if rule["args"]:
-            findings.append({
-                "severity": "medium", "vector": "sudo",
-                "title": f"sudo {rule['path']} (restricted args)"
-                         + (" (NOPASSWD)" if rule["nopasswd"] else ""),
-                "detail": f"sudo rule: {rule['raw']} - check manually whether the allowed arguments can be abused",
-                "command": prefix + rule["path"] + " " + rule["args"],
-                "functions": [],
+
+        if rule.get("manual"):
+            finding = make_finding(
+                "medium", "sudo",
+                f"sudo {rule.get('permitted') or 'rule'} (manual review)",
+                f"sudo rule: {rule.get('raw')} - {rule.get('reason') or 'manual review required'}",
+                "low", sudo_evidence(rule, sudo["status"] == "complete", functions=[]),
+                command=None, manual_review=True,
+            )
+            finding["evidence"].update({
+                "risk": "This sudo command specification could not be mapped safely.",
+                "limitations": ("Wildcard, directory, alias or unusual run-as rules are not "
+                                "evaluated; there is no evidence of exploitability."),
+                "remediation": "Replace broad or unusual rules with exact commands and reviewed arguments.",
             })
+            findings.append(finding)
             continue
+
+        if manual_runas:
+            finding = make_finding(
+                "medium", "sudo",
+                f"sudo {rule.get('path')} (manual run-as review)",
+                f"sudo rule: {rule.get('raw')} - run-as specification could not be interpreted",
+                "low", sudo_evidence(rule, sudo["status"] == "complete",
+                                      functions=[], path_exists=os.path.exists(rule.get("path") or "")),
+                command=None, manual_review=True,
+            )
+            finding["evidence"].update({
+                "risk": "The rule may allow running the command as an unusual target user or group.",
+                "limitations": "The run-as list was not resolved; no privilege claim is made.",
+                "remediation": "Use explicit user names in sudoers run-as lists and review the rule.",
+            })
+            findings.append(finding)
+            continue
+
+        if rule.get("args"):
+            command = None
+            if prefix and rule.get("path"):
+                command = prefix + shlex.quote(rule["path"]) + " " + rule["args"]
+            finding = make_finding(
+                "medium", "sudo",
+                f"sudo {rule['path']} (restricted args)"
+                + (" (NOPASSWD)" if rule["nopasswd"] else ""),
+                f"sudo rule: {rule['raw']} - check manually whether the allowed arguments can be abused",
+                "low",
+                sudo_evidence(rule, sudo["status"] == "complete",
+                              functions=[], path_exists=os.path.exists(rule["path"])),
+                command=command, manual_review=True,
+            )
+            finding["evidence"].update({
+                "risk": ("Only the listed command and arguments are permitted; the program "
+                         "may still have an escape that matches those arguments."
+                         if rule.get("args") else
+                         "The rule permits the command only without arguments."),
+                "limitations": ("The permitted argument list was not evaluated or executed; "
+                                "this is not a verified bypass."),
+                "remediation": ("Remove the rule or constrain arguments further; avoid editors, "
+                                "interpreters and pagers; review the command's argument handling."),
+            })
+            findings.append(finding)
+            continue
+
         key, funcs = matching(db, rule["path"], "sudo")
         if not key or not funcs:
             continue
-        sev = "high" if rule["nopasswd"] and any(f in SERIOUS for f, _ in funcs) else "medium"
+        names = [name for name, _ in funcs]
+        exists = os.path.exists(rule["path"])
+        severity = ("high" if rule["nopasswd"] and any(name in SERIOUS for name in names)
+                    else "medium")
+        title = f"sudo {rule['path']}" + (f" as {user}" if not root else "") \
+                + (" (NOPASSWD)" if rule["nopasswd"] else "")
         detail = f"sudo rule: {rule['raw']}"
         if not root:
             detail += f"  (runs as {user})"
-        title = f"sudo {rule['path']}" + (f" as {user}" if not root else "") \
-                + (" (NOPASSWD)" if rule["nopasswd"] else "")
-        findings.append({
-            "severity": sev, "vector": "sudo",
-            "title": title, "detail": detail, "command": None,
-            "functions": [{"name": name,
-                           "code": rewrite_commands(code, key, rule["path"], prefix)}
-                          for name, code in funcs],
+        limitations = ("GTFOBins documents a technique, not a proof that this version and "
+                       "configuration are exploitable; the snippet was not executed.")
+        if not exists:
+            limitations += " The command path did not exist at scan time."
+        finding = make_finding(
+            severity, "sudo", title, detail,
+            "medium" if exists else "low",
+            sudo_evidence(rule, sudo["status"] == "complete", path_exists=exists,
+                          functions=names),
+            functions=[{"name": name,
+                        "code": rewrite_commands(code, key, rule["path"], prefix)}
+                       for name, code in funcs],
+            manual_review=not exists,
+        )
+        finding["evidence"].update({
+            "risk": (f"The rule runs {rule['path']} as {'root' if root else user}; "
+                     "the documented function may provide a shell or file access."),
+            "limitations": limitations,
+            "remediation": ("Restrict or remove the sudo rule; avoid granting interpreters, "
+                            "editors, pagers and file tools; review sudoers regularly."),
         })
+        findings.append(finding)
 
-    linux = sys.platform.startswith("linux")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        suid_future = pool.submit(scan_suid, full)
-        caps_future = pool.submit(scan_caps) if linux else None
-        suid, suid_complete = suid_future.result()
-        if caps_future:
-            caps, cap_note = caps_future.result()
-        else:
-            caps, cap_note = {}, "not supported on this platform"
-    if not suid_complete:
-        notes.append("SUID scan was incomplete (timeout); results may be missing")
-    if cap_note:
-        notes.append(f"capabilities: {cap_note}")
+    if privileged["status"] != "complete":
+        notes.append(f"SUID/SGID scan {privileged['status']}: {privileged['reason']}")
+    if cap_status == "unsupported":
+        notes.append("capabilities: not supported on this platform")
+    elif cap_status != "complete":
+        notes.append(f"capabilities: {cap_reason}")
 
     unknown = []
     for path in sorted(suid):
         try:
-            st = os.stat(path)
-            owner = pwd.getpwuid(st.st_uid).pw_name
-        except (OSError, KeyError):
+            st = os.lstat(path)
+        except OSError:
             continue
+        writable = writable_by_us(st.st_mode, os.geteuid(), os.access(path, os.W_OK))
+        owner = _id_name(lambda uid: pwd.getpwuid(uid).pw_name, st.st_uid, st.st_uid)
+        group = _id_name(lambda gid: grp.getgrgid(gid).gr_name, st.st_gid, st.st_gid)
         mode = format(stat.S_IMODE(st.st_mode), "04o")
-        if writable_by_us(st.st_mode, os.geteuid(), os.access(path, os.W_OK)):
-            findings.append({
-                "severity": "critical", "vector": "suid",
-                "title": f"writable SUID binary: {path}",
-                "detail": f"owned by {owner}, mode {mode} - writable, root runs it",
-                "command": None,
-                "functions": [],
-            })
         key, funcs = matching(db, path, "suid")
+        names = [name for name, _ in funcs]
+
+        if writable:
+            severity = "critical" if st.st_uid == 0 else "high"
+            target = "root" if st.st_uid == 0 else owner
+            finding = make_finding(
+                severity, "suid", f"writable SUID binary: {path}",
+                f"owner {owner}, group {group}, mode {mode} - writable by the current user",
+                "high",
+                file_evidence(path, st, "suid", suid_complete,
+                              writable=True, functions=names),
+                functions=[{"name": name,
+                            "code": rewrite_commands(code, key, path)}
+                           for name, code in funcs],
+            )
+            finding["evidence"].update({
+                "risk": (f"Anyone who can write this file can replace it and execute code "
+                         f"with the privileges of {target}."),
+                "limitations": ("Writability was observed; the file was not modified or executed. "
+                                "The GTFOBins mapping was not tested."),
+                "remediation": (f"Remove the SUID bit (chmod u-s {path}), restore root-owned "
+                                "mode 0755, and investigate how the file became writable."),
+            })
+            findings.append(finding)
+            continue
+
         if not key:
             unknown.append(path)
             continue
         if not funcs:
             continue
-        sev = "high" if any(f in SERIOUS for f, _ in funcs) else "medium"
-        findings.append({
-            "severity": sev, "vector": "suid",
-            "title": f"SUID {path}",
-            "detail": f"{owner}, mode {mode}",
-            "command": None,
-            "functions": [{"name": f, "code": rewrite_commands(code, key, path)} for f, code in funcs],
+        severity = "high" if any(name in SERIOUS for name in names) else "medium"
+        finding = make_finding(
+            severity, "suid", f"SUID {path}",
+            f"owner {owner}, group {group}, mode {mode}",
+            "medium",
+            file_evidence(path, st, "suid", suid_complete,
+                          writable=False, functions=names),
+            functions=[{"name": name,
+                        "code": rewrite_commands(code, key, path)}
+                       for name, code in funcs],
+        )
+        finding["evidence"].update({
+            "risk": (f"{path} runs with elevated privileges ({owner}); GTFOBins documents "
+                     "a matching function that may provide a shell or file access."),
+            "limitations": ("GTFOBins documents a technique, not proof of exploitability on "
+                            "this version and configuration; the snippet was not executed."
+                            + ("" if st.st_uid == 0 else f" The file is owned by {owner}, not root.")),
+            "remediation": ("Remove the SUID bit if it is not required, update the package, "
+                            "and prefer non-privileged alternatives."),
         })
+        findings.append(finding)
 
-    for path, have in sorted(caps.items()):
+    for path in sorted(sgid):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not writable_by_us(st.st_mode, os.geteuid(), os.access(path, os.W_OK)):
+            continue
+        owner = _id_name(lambda uid: pwd.getpwuid(uid).pw_name, st.st_uid, st.st_uid)
+        group = _id_name(lambda gid: grp.getgrgid(gid).gr_name, st.st_gid, st.st_gid)
+        mode = format(stat.S_IMODE(st.st_mode), "04o")
+        privileged_group = st.st_gid == 0 or group in PRIVILEGED_GROUPS
+        severity = "critical" if privileged_group else "high"
+        finding = make_finding(
+            severity, "sgid", f"writable SGID binary: {path}",
+            f"owner {owner}, group {group}, mode {mode} - writable by the current user",
+            "high",
+            file_evidence(path, st, "sgid", suid_complete,
+                          writable=True, functions=[]),
+            functions=[],
+        )
+        finding["evidence"].update({
+            "risk": (f"Anyone who can write this file can replace it and execute code with "
+                     f"the privileges of group {group}. SGID is not root unless the group "
+                     "is privileged."),
+            "limitations": ("Writability was observed; the file was not modified or executed. "
+                            "GTFOBins has no SGID contexts, so no snippet is correlated."),
+            "remediation": (f"Remove the SGID bit (chmod g-s {path}), correct its ownership "
+                            "and mode, and investigate how it became writable."),
+        })
+        findings.append(finding)
+
+    for path, have in sorted(caps["caps"].items()):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            cap_stat_errors += 1
+            continue
+        writable = writable_by_us(st.st_mode, os.geteuid(), os.access(path, os.W_OK))
         key, funcs = matching(db, path, "capabilities", have)
+        names = [name for name, _ in funcs]
+        cap_list = sorted(have)
+        if writable:
+            severity = "critical" if st.st_uid == 0 else "high"
+            owner = _id_name(lambda uid: pwd.getpwuid(uid).pw_name, st.st_uid, st.st_uid)
+            finding = make_finding(
+                severity, "capabilities", f"writable binary with capabilities: {path}",
+                f"owner {owner}, capabilities {', '.join(cap_list)} - writable by the current user",
+                "high",
+                file_evidence(path, st, "capabilities", cap_status == "complete",
+                              writable=True, capabilities=cap_list, functions=names),
+                functions=[{"name": name,
+                            "code": rewrite_commands(code, key, path)}
+                           for name, code in funcs],
+            )
+            finding["evidence"].update({
+                "risk": ("Anyone who can write this file can replace it and inherit its "
+                         "file capabilities."),
+                "limitations": ("Writability was observed; the file was not modified or executed. "
+                                "The capability effect was not tested."),
+                "remediation": (f"Remove the file capabilities (setcap -r {path}) or restore "
+                                "root-owned mode 0755; investigate how it became writable."),
+            })
+            findings.append(finding)
+            continue
         if not key or not funcs:
             continue
-        sev = "high" if any(f in SERIOUS for f, _ in funcs) else "medium"
-        findings.append({
-            "severity": sev, "vector": "capabilities",
-            "title": f"capabilities {path}",
-            "detail": ", ".join(sorted(have)),
-            "command": None,
-            "functions": [{"name": f, "code": rewrite_commands(code, key, path)} for f, code in funcs],
+        severity = "high" if any(name in SERIOUS for name in names) else "medium"
+        finding = make_finding(
+            severity, "capabilities", f"capabilities {path}",
+            ", ".join(cap_list),
+            "medium",
+            file_evidence(path, st, "capabilities", cap_status == "complete",
+                          writable=False, capabilities=cap_list, functions=names),
+            functions=[{"name": name,
+                        "code": rewrite_commands(code, key, path)}
+                       for name, code in funcs],
+        )
+        finding["evidence"].update({
+            "risk": ("The binary retains file capabilities that, combined with a documented "
+                     "GTFOBins function, may provide elevated access."),
+            "limitations": ("Capability presence does not prove exploitability; the version, "
+                            "configuration and snippet were not tested."),
+            "remediation": ("Remove unnecessary capabilities (setcap -r PATH), use the least "
+                            "privilege required, and prefer systemd/ambient capabilities."),
         })
+        findings.append(finding)
 
-    findings.sort(key=lambda f: (SEVERITY[f["severity"]], f["vector"], f["title"]))
+    if cap_stat_errors:
+        if cap_status == "complete":
+            cap_status = "partial"
+        cap_reason = "; ".join(filter(None, [cap_reason,
+                                             f"could not stat {cap_stat_errors} result(s)"]))
+        notes.append(f"capabilities: could not stat {cap_stat_errors} result(s)")
+        for finding in findings:
+            if finding["vector"] == "capabilities":
+                finding["evidence"]["scan_complete"] = False
+
+    notes = list(dict.fromkeys(notes))
+    checks = {
+        "sudo": {"status": sudo["status"], "reason": sudo["error"],
+                 "count": len(sudo["rules"])},
+        "suid": {"status": privileged["status"], "reason": privileged["reason"],
+                 "count": len(suid)},
+        "sgid": {"status": privileged["status"], "reason": privileged["reason"],
+                 "count": len(sgid),
+                 "note": "GTFOBins has no SGID contexts; only writable SGID files are reported."},
+        "capabilities": {"status": cap_status, "reason": cap_reason,
+                         "count": len(caps["caps"])},
+    }
+    coverage = {
+        "complete": all(check["status"] in ("complete", "unsupported")
+                        for check in checks.values()),
+        "checks": checks,
+    }
+
+    findings.sort(key=lambda f: (SEVERITY[f["severity"]], CONFIDENCE[f["confidence"]],
+                                 f["vector"], f["title"]))
     elapsed = time.time() - started
+    exit_code = check_exit_code(findings, fail_on)
+    if privileged["status"] in ("unavailable", "failed"):
+        exit_code = EXIT_ERROR
 
     if as_json:
-        print(json.dumps({
-            "version": VERSION, "platform": sys.platform, "user": pwd.getpwuid(os.getuid()).pw_name,
+        payload = {
+            "version": VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "platform": sys.platform,
+            "user": _id_name(lambda uid: pwd.getpwuid(uid).pw_name, os.getuid(), os.getuid()),
             "elapsed": round(elapsed, 2),
             "tested": {
-                "suid": len(suid), "capabilities": len(caps), "sudo": sudo["ok"],
-                "suid_complete": suid_complete, "capabilities_checked": cap_note is None,
+                "suid": len(suid), "sgid": len(sgid),
+                "capabilities": len(caps["caps"]), "sudo": sudo["ok"],
+                "suid_complete": suid_complete, "sgid_complete": suid_complete,
+                "capabilities_checked": cap_status == "complete",
             },
-            "findings": findings, "notes": notes,
-        }, indent=2))
-        return
+            "coverage": coverage,
+            "findings": findings,
+            "notes": notes,
+        }
+        print(json.dumps(payload, indent=2))
+        return exit_code
 
+    user = _id_name(lambda uid: pwd.getpwuid(uid).pw_name, os.getuid(), os.getuid())
     print(bold("Escabin local check") + dim(
-        f"  {sys.platform}  user={pwd.getpwuid(os.getuid()).pw_name}  {elapsed:.1f}s"))
-    cap_text = f"{len(caps)} capabilities" if cap_note is None else "capabilities not checked"
-    print(dim(f"scanned {len(suid)} SUID binaries, {cap_text}; sudo -l {'ok' if sudo['ok'] else 'unavailable'}"))
+        f"  {sys.platform}  user={safe_text(user)}  {elapsed:.1f}s"))
+    print(dim("checks: " + safe_text(coverage_summary(coverage))))
+    print(dim("coverage: " + ("complete" if coverage["complete"]
+                              else "incomplete (see notes)")))
 
     if not findings:
         print()
-        print(green("no GTFOBins privilege-escalation vector found"))
+        if coverage["complete"]:
+            print(green("scan complete: no GTFOBins privilege-escalation vector found"))
+        else:
+            print(yellow("no vector found in the checks that completed; coverage is incomplete"))
         for note in notes:
-            print(dim("  note: " + note))
-        return
+            print(dim("  note: " + safe_text(note)))
+        if unknown:
+            print(dim(f"  note: {len(unknown)} SUID binaries have no GTFOBins entry"))
+        return exit_code
 
     colors = {"critical": red, "high": yellow, "medium": cyan}
     for finding in findings:
         print()
-        print(f"{colors[finding['severity']](finding['severity'].upper()):<10} {bold(finding['title'])}")
+        print(f"{colors[finding['severity']](finding['severity'].upper()):<10} "
+              f"{bold(safe_text(finding['title']))}")
+        meta = (f"{finding['confidence']} confidence; "
+                "exploitability unverified")
+        if finding["manual_review"]:
+            meta += "; manual review"
+        print(dim("          " + meta))
         if finding["detail"]:
-            print(dim("          " + finding["detail"]))
+            print(dim("          " + safe_text(finding["detail"])))
+        if finding["evidence"]:
+            print(dim("          evidence: " + safe_text(evidence_summary(finding))))
         if finding["command"]:
-            print("          $ " + finding["command"])
+            print("          $ " + safe_text(finding["command"]))
         for fn in finding["functions"]:
-            print("          " + cyan(fn["name"]))
+            print("          " + cyan(safe_text(fn["name"])))
             for line in fn["code"].splitlines():
-                print("          $ " + line)
+                print("          $ " + safe_text(line))
+        for label in ("risk", "limitations", "remediation"):
+            if finding["evidence"].get(label):
+                print(dim(f"          {label}: " + safe_text(finding["evidence"][label])))
 
     if unknown:
         print()
+        shown = ", ".join(safe_text(path) for path in unknown[:6])
         print(dim(f"note: {len(unknown)} SUID binaries have no GTFOBins entry" +
-                  (": " + ", ".join(unknown[:6]) + (" ..." if len(unknown) > 6 else ""))))
+                  (": " + shown + (" ..." if len(unknown) > 6 else ""))))
     for note in notes:
-        print(dim("note: " + note))
+        print(dim("note: " + safe_text(note)))
     print()
     print(dim("hint: `escabin <binary>` shows every documented trick for a binary"))
+    return exit_code
 
 
 # ---------------------------------------------------------------- cli
@@ -701,6 +1496,10 @@ def main():
     p_check.add_argument("--full", action="store_true", help="scan the whole filesystem (slow)")
     p_check.add_argument("--ask-sudo", action="store_true", help="allow sudo to prompt for a password")
     p_check.add_argument("--json", action="store_true", help="machine-readable output")
+    p_check.add_argument(
+        "--fail-on", choices=("critical", "high", "medium"),
+        help="exit 3 if a finding at or above this severity exists (default: 0)",
+    )
 
     sub.add_parser("update", help="download the latest GTFOBins data")
     sub.add_parser("list", help="list all documented binaries")
@@ -719,10 +1518,10 @@ def main():
     elif args.cmd == "search":
         cmd_search(db, args.term, args.n)
     elif args.cmd == "check":
-        cmd_check(db, args.full, args.json, args.ask_sudo)
+        sys.exit(cmd_check(db, args.full, args.json, args.ask_sudo, args.fail_on))
     elif args.cmd == "list":
         for name in sorted(db.ex):
-            print(name)
+            print(safe_text(name))
     else:
         parser.print_help()
 

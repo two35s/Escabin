@@ -4,11 +4,12 @@ set -eu
 raw="https://raw.githubusercontent.com/two35s/Escabin/main"
 dir="$HOME/.local/share/escabin"
 target="$HOME/.local/bin/escabin"
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 tmp=""
+staged=""
 
 cleanup() {
     [ -z "$tmp" ] || rm -f "$tmp"
+    [ -z "$staged" ] || rm -f "$staged"
 }
 trap cleanup 0
 
@@ -29,15 +30,28 @@ if { [ -e "$target" ] || [ -L "$target" ]; } &&
     exit 1
 fi
 
-if [ -f "$here/escabin" ]; then
-    src="$here/escabin"
+# Use a local checkout only when this really is the repo's install.sh; when the
+# script is piped to sh, $0 is "sh" and a file named escabin in the cwd must not
+# be installed by accident. tests.py is a cheap marker for a full checkout.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+local_src=""
+if [ "$(basename "$0")" = "install.sh" ] && [ -f "$here/escabin" ] &&
+   [ -f "$here/tests.py" ]; then
+    local_src="$here/escabin"
+fi
+
+if [ -n "$local_src" ]; then
+    src="$local_src"
 else
     command -v curl >/dev/null 2>&1 || {
         echo "curl is required for a remote install" >&2
         exit 1
     }
     tmp=$(mktemp "${TMPDIR:-/tmp}/escabin.XXXXXX")
-    curl -fsSL "$raw/escabin" -o "$tmp"
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp" "$raw/escabin"; then
+        echo "download failed: $raw/escabin" >&2
+        exit 1
+    fi
     [ -s "$tmp" ] || {
         echo "download failed: empty file" >&2
         exit 1
@@ -45,7 +59,14 @@ else
     src="$tmp"
 fi
 
-install -m 755 "$src" "$dir/escabin"
+staged="$dir/.escabin.new.$$"
+install -m 755 "$src" "$staged"
+if ! "$staged" --version >/dev/null 2>&1; then
+    echo "refusing to install: the new escabin does not run" >&2
+    exit 1
+fi
+mv -f "$staged" "$dir/escabin"
+staged=""
 ln -sf "$dir/escabin" "$target"
 if ! "$dir/escabin" update; then
     echo "warning: could not update data; run 'escabin update' later" >&2
