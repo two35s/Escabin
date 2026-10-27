@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>escabin</h1>
+<h1>Escabin</h1>
 
 <a href="https://github.com/two35s/Escabin"><img alt="version 2.1" src="https://img.shields.io/badge/version-2.1-5c4ee5?style=flat-square"></a>
 <a href="#requirements"><img alt="Python 3.7+" src="https://img.shields.io/badge/Python-3.7%2B-3776ab?style=flat-square&amp;logo=python&amp;logoColor=white"></a>
