@@ -1,10 +1,14 @@
-# escabin
+<div align="center">
 
-[![version](https://img.shields.io/badge/version-2.1-5c4ee5?style=flat-square)](#escabin)
-[![Python 3.7+](https://img.shields.io/badge/Python-3.7%2B-3776ab?style=flat-square&logo=python&logoColor=white)](#requirements)
-[![Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-f4c430?style=flat-square)](#requirements)
-[![stdlib only](https://img.shields.io/badge/dependencies-none-2ea44f?style=flat-square)](#requirements)
-[![GTFOBins](https://img.shields.io/badge/data-GTFOBins-cb3837?style=flat-square)](https://gtfobins.org)
+<h1>escabin</h1>
+
+<a href="https://github.com/two35s/Escabin"><img alt="version 2.1" src="https://img.shields.io/badge/version-2.1-5c4ee5?style=flat-square"></a>
+<a href="#requirements"><img alt="Python 3.7+" src="https://img.shields.io/badge/Python-3.7%2B-3776ab?style=flat-square&amp;logo=python&amp;logoColor=white"></a>
+<a href="#requirements"><img alt="Linux and macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-f4c430?style=flat-square"></a>
+<a href="#requirements"><img alt="no dependencies" src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat-square"></a>
+<a href="https://gtfobins.org"><img alt="GTFOBins data" src="https://img.shields.io/badge/data-GTFOBins-cb3837?style=flat-square"></a>
+
+</div>
 
 Offline [GTFOBins](https://gtfobins.org) lookup and a fast local privilege-escalation
 audit. One Python file, standard library only.
