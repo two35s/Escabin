@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""Offline GTFOBins lookup and local privilege-escalation audit.
+
+Data comes from https://gtfobins.org/api.json (cached, refresh with `update`).
+Stdlib only, so it runs anywhere python3 does.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "1.1"
+API_URL = "https://gtfobins.org/api.json"
+DATA_DIR = os.environ.get("GTFOBINS_HOME") or os.path.join(
+    os.path.expanduser("~"), ".local", "share", "gtfobins"
+)
+API_PATH = os.path.join(DATA_DIR, "api.json")
+
+SEVERITY = {"critical": 0, "high": 1, "medium": 2}
+FUNC_ORDER = [
+    "shell", "command", "reverse-shell", "bind-shell", "privilege-escalation",
+    "file-write", "file-read", "library-load", "upload", "download", "list",
+    "tty", "connector", "sender", "receiver",
+]
+SHELLISH = {"shell", "command", "reverse-shell", "bind-shell", "privilege-escalation"}
+# file-write and file-read are root too: /etc/sudoers.d and /etc/shadow are one step away
+SERIOUS = SHELLISH | {"file-write", "file-read"}
+TOOL_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+PRUNE_FULL = [
+    "/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker",
+    "/System/Volumes", "/Volumes", "/private/var/vm",
+]
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def paint(text, code):
+    return f"\033[{code}m{text}\033[0m" if TTY else str(text)
+
+
+def bold(t):
+    return paint(t, "1")
+
+
+def dim(t):
+    return paint(t, "2")
+
+
+def red(t):
+    return paint(t, "1;31")
+
+
+def yellow(t):
+    return paint(t, "1;33")
+
+
+def cyan(t):
+    return paint(t, "1;36")
+
+
+def green(t):
+    return paint(t, "1;32")
+
+
+def die(msg):
+    print(f"gtfobins: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def clean_md(text):
+    text = (text or "").replace("`", "")
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    return text.strip()
+
+
+def system_tool(name):
+    """Resolve audit tools from system dirs, not from PATH."""
+    for directory in TOOL_DIRS:
+        path = os.path.join(directory, name)
+        if os.access(path, os.X_OK):
+            return path
+    return shutil.which(name)
+
+
+# ---------------------------------------------------------------- data
+
+def download():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    req = urllib.request.Request(API_URL, headers={"User-Agent": f"gtfobins/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read()
+    data = json.loads(raw)  # refuse to cache garbage
+    if not all(k in data for k in ("executables", "functions", "contexts")):
+        raise ValueError("unexpected API shape")
+    digest = hashlib.sha256(raw).hexdigest()
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".api.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, API_PATH)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return len(raw), digest
+
+
+def load_api(refresh=False):
+    if refresh:
+        try:
+            size, digest = download()
+        except Exception as exc:
+            die(f"update failed: {exc}")
+        print(f"updated {API_PATH} ({size / 1024:.0f} KiB, sha256 {digest})")
+    if not os.path.exists(API_PATH):
+        try:
+            download()
+        except Exception as exc:
+            die(f"no local data and download failed: {exc}")
+    with open(API_PATH, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not all(k in data for k in ("executables", "functions", "contexts")):
+        die("corrupt data file, run: gtfobins update")
+    return data
+
+
+class DB:
+    def __init__(self, data):
+        self.data = data
+        self.ex = data["executables"]
+        self.aliases = {}
+        for name, entry in self.ex.items():
+            alias = entry.get("alias")
+            for a in [alias] if isinstance(alias, str) else (alias or []):
+                self.aliases.setdefault(a, name)
+
+    def canon(self, ref):
+        name = os.path.basename(ref.rstrip("/")) or ref
+        stripped = re.sub(r"-?\d+(\.\d+)*$", "", name)
+        for cand in (name, stripped):
+            if not cand:
+                continue
+            for _ in range(4):
+                if cand in self.ex:
+                    entry = self.ex[cand]
+                    if not entry.get("functions") and isinstance(entry.get("alias"), str):
+                        cand = entry["alias"]
+                        continue
+                    return cand
+                if cand in self.aliases:
+                    cand = self.aliases[cand]
+                    continue
+                break
+        return None
+
+    def funcs(self, name):
+        return (self.ex.get(name) or {}).get("functions") or {}
+
+    def ordered(self, funcs):
+        return sorted(funcs, key=lambda f: (FUNC_ORDER.index(f) if f in FUNC_ORDER else 99, f))
+
+    def label(self, func):
+        return (self.data["functions"].get(func) or {}).get("label", func)
+
+
+def context_code(item, ctx):
+    over = (item.get("contexts") or {}).get(ctx)
+    if isinstance(over, dict) and over.get("code"):
+        return over["code"]
+    return item.get("code")
+
+
+def context_caps(item, ctx):
+    over = (item.get("contexts") or {}).get(ctx)
+    if isinstance(over, dict) and over.get("list"):
+        need = over["list"]
+        return [need] if isinstance(need, str) else list(need)
+    return None
+
+
+SHELL_META = "|;&()<>"
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!",
+                  "time", "exec", "command", "env", "nohup"}
+
+
+def rewrite_commands(code, binary, path, prefix=""):
+    """Rewrite every command-position use of `binary` to `path`, optionally sudo-prefixed."""
+    names = {binary, os.path.basename(path)}
+    return "\n".join(_rewrite_line(line, names, path, prefix)
+                     for line in (code or "").splitlines())
+
+
+def _rewrite_line(line, names, path, prefix):
+    out = []
+    i, n = 0, len(line)
+    quote = None
+    cmd_pos = True
+    while i < n:
+        ch = line[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(line[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch in " \t":
+            out.append(ch)
+            i += 1
+            continue
+        if ch in SHELL_META:
+            out.append(ch)
+            if i + 1 < n and line[i + 1] == ch and ch in "|&":
+                out.append(ch)
+                i += 1
+            if ch in "|;&(":
+                cmd_pos = True
+            i += 1
+            continue
+
+        start = i
+        j = i
+        if cmd_pos:
+            while True:
+                env = re.match(
+                    r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|[^\s;|&()<>]+)[ \t]*",
+                    line[j:],
+                )
+                if not env:
+                    break
+                j += env.end()
+        k = j
+        while k < n and line[k] not in " \t" + SHELL_META:
+            k += 1
+        word = line[j:k]
+        if cmd_pos and word in names:
+            out.append(prefix + line[start:j] + path)
+            i = k
+            cmd_pos = False
+            continue
+        out.append(line[start:k])
+        i = k
+        cmd_pos = cmd_pos and word in SHELL_KEYWORDS
+    return "".join(out)
+
+
+def print_code(code, indent="    "):
+    for line in (code or "").rstrip().splitlines():
+        print(indent + line)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_show(db, ref):
+    key = db.canon(ref)
+    if not key:
+        die(f"'{ref}' not in GTFOBins (try: gtfobins search {ref})")
+    entry = db.ex[key]
+    print(bold(key))
+    if entry.get("alias"):
+        alias = entry["alias"]
+        print(dim("alias: " + (alias if isinstance(alias, str) else ", ".join(alias))))
+    if entry.get("comment"):
+        print(textwrap.fill(clean_md(entry["comment"]), 96))
+    funcs = db.funcs(key)
+    if not funcs:
+        print("no functions documented (alias only)")
+        return
+    for fname in db.ordered(funcs):
+        print()
+        print(bold(db.label(fname)))
+        for item in funcs[fname]:
+            print("  " + cyan(" ".join(f"[{c}]" for c in (item.get("contexts") or {}))))
+            base = item.get("code")
+            print_code(base, "    ")
+            for ctx, over in (item.get("contexts") or {}).items():
+                if isinstance(over, dict) and over.get("code") and over["code"] != base:
+                    print(dim(f"    {ctx}:"))
+                    print_code(over["code"], "      ")
+            caps = context_caps(item, "capabilities")
+            if caps:
+                print(dim("    needs: " + ", ".join(caps)))
+            if item.get("comment"):
+                print(dim(textwrap.fill(clean_md(item["comment"]), 96,
+                                        initial_indent="    # ",
+                                        subsequent_indent="    # ")))
+
+
+def cmd_search(db, term, limit):
+    needle = term.lower()
+    rows = []
+    for name in sorted(db.ex):
+        matched = []
+        for fname, items in db.funcs(name).items():
+            hay = db.label(fname) + " " + " ".join(
+                (it.get("code") or "") + " " + (it.get("comment") or "") for it in items
+            )
+            if needle in hay.lower():
+                matched.append(fname)
+        if needle in name.lower() or matched:
+            rows.append((name, db.ordered(set(matched))))
+    if not rows:
+        print(f"no match for '{term}'")
+        return
+    for name, funcs in rows[:limit]:
+        detail = ", ".join(db.label(f).lower() for f in funcs) if funcs else "name match"
+        print(f"{bold(name.ljust(26))} {dim(detail)}")
+    if len(rows) > limit:
+        print(dim(f"... {len(rows) - limit} more (raise -n)"))
+
+
+# ---------------------------------------------------------------- local scan
+
+def fast_roots():
+    if sys.platform == "darwin":
+        return [
+            "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec",
+            "/usr/local/bin", "/usr/local/sbin", "/opt/homebrew/bin", "/opt/homebrew/sbin",
+            "/Applications", "/Library", "/System/Applications",
+            "/System/Library/CoreServices", "/private/tmp", "/private/var/tmp",
+            "/Users/Shared",
+        ]
+    return [
+        "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec",
+        "/usr/local/bin", "/usr/local/sbin", "/opt", "/snap/bin",
+        "/tmp", "/var/tmp",
+    ]
+
+
+def scan_suid(full):
+    find = system_tool("find")
+    if not find:
+        die("find not found; cannot scan for SUID binaries")
+    roots = ["/"] if full else fast_roots()
+    prune = PRUNE_FULL if full else []
+
+    def one(root):
+        args = [find, root]
+        for p in prune:
+            args += ["-path", p, "-prune", "-o"]
+        args += ["-type", "f", "-perm", "-4000", "-print"]
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  timeout=900 if full else 120, errors="replace")
+            return proc.stdout.splitlines(), True
+        except subprocess.TimeoutExpired as exc:
+            print(f"gtfobins: warning: scanning {root} timed out, results incomplete",
+                  file=sys.stderr)
+            out = exc.stdout or ""
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+            return out.splitlines(), False
+        except OSError:
+            return [], False
+
+    paths = set()
+    complete = True
+    workers = min(8, max(1, len(roots)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for found, ok in pool.map(one, roots):
+            paths.update(found)
+            complete = complete and ok
+    return paths, complete
+
+
+def scan_caps():
+    exe = system_tool("getcap")
+    if not exe:
+        return {}, "getcap not installed"
+    try:
+        proc = subprocess.run([exe, "-r", "/"], capture_output=True, text=True,
+                              timeout=180, errors="replace")
+    except subprocess.TimeoutExpired:
+        return {}, "getcap timed out, not checked"
+    except OSError as exc:
+        return {}, f"getcap failed: {exc}"
+    caps = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        path, attrs = parts
+        caps[path] = set(re.split(r"[=+]", attrs)[0].split(","))
+    return caps, None
+
+
+def parse_sudo(out):
+    chunks = []
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith("("):
+            chunks.append(line)
+        elif line and chunks and raw[:1] in (" ", "\t"):
+            chunks[-1] += " " + line
+
+    rules = []
+    for chunk in chunks:
+        parsed = re.match(r"\(([^)]*)\)\s*(.*)", chunk)
+        if not parsed:
+            continue
+        runas, body = parsed.groups()
+        nopasswd = False
+        for entry in re.split(r",\s*", body):
+            entry = entry.strip()
+            if not entry:
+                continue
+            override = re.match(r"\(([^)]*)\)\s*(.*)", entry)
+            if override:
+                runas, entry = override.groups()
+            while True:
+                tag = re.match(r"([A-Z_]+):\s*(.*)", entry)
+                if not tag:
+                    break
+                if tag.group(1) == "NOPASSWD":
+                    nopasswd = True
+                elif tag.group(1) == "PASSWD":
+                    nopasswd = False
+                entry = tag.group(2)
+            if not entry:
+                continue
+            if entry.upper() == "ALL":
+                rules.append({"all": True, "runas": runas, "nopasswd": nopasswd, "raw": chunk})
+            elif entry.startswith("/"):
+                path = entry.split()[0]
+                rules.append({"all": False, "path": path, "args": entry[len(path):].strip(),
+                              "runas": runas, "nopasswd": nopasswd, "raw": chunk})
+    return rules
+
+
+def scan_sudo(ask=False):
+    exe = system_tool("sudo")
+    if not exe:
+        return {"ok": False, "rules": [], "error": "sudo not installed"}
+    args = [exe, "-l"] if ask else [exe, "-n", "-l"]
+    try:
+        if ask:
+            proc = subprocess.run(args, stdout=subprocess.PIPE, text=True,
+                                  timeout=300, errors="replace")
+        else:
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  timeout=20, errors="replace")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"ok": False, "rules": [], "error": f"sudo -l failed: {exc}"}
+    out = proc.stdout or ""
+    if not ask:
+        out += proc.stderr or ""
+    if proc.returncode != 0:
+        if not ask and "password" in out.lower():
+            err = "a password is required (rerun with --ask-sudo)"
+        elif not ask:
+            err = "not permitted"
+        else:
+            err = f"sudo -l failed (exit {proc.returncode})"
+        return {"ok": False, "rules": [], "error": f"sudo: {err}"}
+    return {"ok": True, "rules": parse_sudo(out), "error": None}
+
+
+def matching(db, path, ctx, have_caps=None):
+    key = db.canon(path)
+    if not key:
+        return None, []
+    out = []
+    for fname, items in db.funcs(key).items():
+        for item in items:
+            if ctx not in (item.get("contexts") or {}):
+                continue
+            if ctx == "capabilities" and have_caps is not None:
+                need = context_caps(item, ctx)
+                if need and not {c.lower() for c in need} <= {c.lower() for c in have_caps}:
+                    continue
+            code = context_code(item, ctx)
+            if code:
+                out.append((fname, code))
+            break
+    out.sort(key=lambda pair: (FUNC_ORDER.index(pair[0]) if pair[0] in FUNC_ORDER else 99, pair[0]))
+    return key, out
+
+
+def runas_user(rule):
+    return (rule.get("runas") or "root").split(":")[0].strip() or "root"
+
+
+def is_root_runas(user):
+    return user.upper() == "ALL" or user == "root"
+
+
+def writable_by_us(st_mode, euid, can_write):
+    # root passes access(W_OK) for everything, so only mode bits are meaningful there
+    return bool(st_mode & 0o022) or (euid != 0 and can_write)
+
+
+def cmd_check(db, full, as_json, ask_sudo=False):
+    started = time.time()
+    notes = []
+    findings = []
+
+    sudo = scan_sudo(ask_sudo)
+    if not sudo["ok"]:
+        notes.append(sudo["error"])
+    seen_rules = set()
+    for rule in sudo["rules"]:
+        user = runas_user(rule)
+        root = is_root_runas(user)
+        prefix = "sudo " if root else f"sudo -u {user} "
+        if rule["all"]:
+            findings.append({
+                "severity": "critical" if root else "high",
+                "vector": "sudo",
+                "title": "sudo: unrestricted" if root else f"sudo as {user}: unrestricted",
+                "detail": rule["raw"],
+                "command": "sudo -i" if root else f"sudo -u {user} -i",
+                "functions": [],
+            })
+            continue
+        dedupe = (rule["path"], rule["args"], rule["nopasswd"], user)
+        if dedupe in seen_rules:
+            continue
+        seen_rules.add(dedupe)
+        if rule["args"]:
+            findings.append({
+                "severity": "medium", "vector": "sudo",
+                "title": f"sudo {rule['path']} (restricted args)"
+                         + (" (NOPASSWD)" if rule["nopasswd"] else ""),
+                "detail": f"sudo rule: {rule['raw']} - check manually whether the allowed arguments can be abused",
+                "command": prefix + rule["path"] + " " + rule["args"],
+                "functions": [],
+            })
+            continue
+        key, funcs = matching(db, rule["path"], "sudo")
+        if not key or not funcs:
+            continue
+        sev = "high" if rule["nopasswd"] and any(f in SERIOUS for f, _ in funcs) else "medium"
+        detail = f"sudo rule: {rule['raw']}"
+        if not root:
+            detail += f"  (runs as {user})"
+        title = f"sudo {rule['path']}" + (f" as {user}" if not root else "") \
+                + (" (NOPASSWD)" if rule["nopasswd"] else "")
+        findings.append({
+            "severity": sev, "vector": "sudo",
+            "title": title, "detail": detail, "command": None,
+            "functions": [{"name": name,
+                           "code": rewrite_commands(code, key, rule["path"], prefix)}
+                          for name, code in funcs],
+        })
+
+    linux = sys.platform.startswith("linux")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        suid_future = pool.submit(scan_suid, full)
+        caps_future = pool.submit(scan_caps) if linux else None
+        suid, suid_complete = suid_future.result()
+        if caps_future:
+            caps, cap_note = caps_future.result()
+        else:
+            caps, cap_note = {}, "not supported on this platform"
+    if not suid_complete:
+        notes.append("SUID scan was incomplete (timeout); results may be missing")
+    if cap_note:
+        notes.append(f"capabilities: {cap_note}")
+
+    unknown = []
+    for path in sorted(suid):
+        try:
+            st = os.stat(path)
+            owner = pwd.getpwuid(st.st_uid).pw_name
+        except (OSError, KeyError):
+            continue
+        mode = format(stat.S_IMODE(st.st_mode), "04o")
+        if writable_by_us(st.st_mode, os.geteuid(), os.access(path, os.W_OK)):
+            findings.append({
+                "severity": "critical", "vector": "suid",
+                "title": f"writable SUID binary: {path}",
+                "detail": f"owned by {owner}, mode {mode} - writable, root runs it",
+                "command": None,
+                "functions": [],
+            })
+        key, funcs = matching(db, path, "suid")
+        if not key:
+            unknown.append(path)
+            continue
+        if not funcs:
+            continue
+        sev = "high" if any(f in SERIOUS for f, _ in funcs) else "medium"
+        findings.append({
+            "severity": sev, "vector": "suid",
+            "title": f"SUID {path}",
+            "detail": f"{owner}, mode {mode}",
+            "command": None,
+            "functions": [{"name": f, "code": rewrite_commands(code, key, path)} for f, code in funcs],
+        })
+
+    for path, have in sorted(caps.items()):
+        key, funcs = matching(db, path, "capabilities", have)
+        if not key or not funcs:
+            continue
+        sev = "high" if any(f in SERIOUS for f, _ in funcs) else "medium"
+        findings.append({
+            "severity": sev, "vector": "capabilities",
+            "title": f"capabilities {path}",
+            "detail": ", ".join(sorted(have)),
+            "command": None,
+            "functions": [{"name": f, "code": rewrite_commands(code, key, path)} for f, code in funcs],
+        })
+
+    findings.sort(key=lambda f: (SEVERITY[f["severity"]], f["vector"], f["title"]))
+    elapsed = time.time() - started
+
+    if as_json:
+        print(json.dumps({
+            "version": VERSION, "platform": sys.platform, "user": pwd.getpwuid(os.getuid()).pw_name,
+            "elapsed": round(elapsed, 2),
+            "tested": {
+                "suid": len(suid), "capabilities": len(caps), "sudo": sudo["ok"],
+                "suid_complete": suid_complete, "capabilities_checked": cap_note is None,
+            },
+            "findings": findings, "notes": notes,
+        }, indent=2))
+        return
+
+    print(bold("GTFOBins local check") + dim(
+        f"  {sys.platform}  user={pwd.getpwuid(os.getuid()).pw_name}  {elapsed:.1f}s"))
+    cap_text = f"{len(caps)} capabilities" if cap_note is None else "capabilities not checked"
+    print(dim(f"scanned {len(suid)} SUID binaries, {cap_text}; sudo -l {'ok' if sudo['ok'] else 'unavailable'}"))
+
+    if not findings:
+        print()
+        print(green("no GTFOBins privilege-escalation vector found"))
+        for note in notes:
+            print(dim("  note: " + note))
+        return
+
+    colors = {"critical": red, "high": yellow, "medium": cyan}
+    for finding in findings:
+        print()
+        print(f"{colors[finding['severity']](finding['severity'].upper()):<10} {bold(finding['title'])}")
+        if finding["detail"]:
+            print(dim("          " + finding["detail"]))
+        if finding["command"]:
+            print("          $ " + finding["command"])
+        for fn in finding["functions"]:
+            print("          " + cyan(fn["name"]))
+            for line in fn["code"].splitlines():
+                print("          $ " + line)
+
+    if unknown:
+        print()
+        print(dim(f"note: {len(unknown)} SUID binaries have no GTFOBins entry" +
+                  (": " + ", ".join(unknown[:6]) + (" ..." if len(unknown) > 6 else ""))))
+    for note in notes:
+        print(dim("note: " + note))
+    print()
+    print(dim("hint: `gtfobins <binary>` shows every documented trick for a binary"))
+
+
+# ---------------------------------------------------------------- cli
+
+def main():
+    argv = sys.argv[1:]
+    commands = {"show", "search", "check", "update", "list"}
+    if argv and not argv[0].startswith("-") and argv[0] not in commands:
+        argv = ["show"] + argv
+
+    parser = argparse.ArgumentParser(
+        prog="gtfobins",
+        description="Offline GTFOBins lookup and local privilege-escalation audit.",
+    )
+    parser.add_argument("--version", action="version", version=f"gtfobins {VERSION}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_show = sub.add_parser("show", help="show every documented trick for a binary")
+    p_show.add_argument("binary")
+
+    p_search = sub.add_parser("search", help="search binaries, functions, commands and comments")
+    p_search.add_argument("term")
+    p_search.add_argument("-n", type=int, default=40, help="max results (default 40)")
+
+    p_check = sub.add_parser("check", help="audit this machine against GTFOBins")
+    p_check.add_argument("--full", action="store_true", help="scan the whole filesystem (slow)")
+    p_check.add_argument("--ask-sudo", action="store_true", help="allow sudo to prompt for a password")
+    p_check.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sub.add_parser("update", help="download the latest GTFOBins data")
+    sub.add_parser("list", help="list all documented binaries")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "update":
+        db = DB(load_api(refresh=True))
+        print(f"{len(db.ex)} binaries indexed")
+        return
+
+    db = DB(load_api())
+
+    if args.cmd == "show":
+        cmd_show(db, args.binary)
+    elif args.cmd == "search":
+        cmd_search(db, args.term, args.n)
+    elif args.cmd == "check":
+        cmd_check(db, args.full, args.json, args.ask_sudo)
+    elif args.cmd == "list":
+        for name in sorted(db.ex):
+            print(name)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
