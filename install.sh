@@ -14,6 +14,15 @@ trap cleanup 0
 
 mkdir -p "$dir" "$HOME/.local/bin"
 
+command -v python3 >/dev/null 2>&1 || {
+    echo "python3 is required" >&2
+    exit 1
+}
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 7))' 2>/dev/null; then
+    echo "python3 3.7 or newer is required" >&2
+    exit 1
+fi
+
 if { [ -e "$target" ] || [ -L "$target" ]; } &&
    [ "$(readlink "$target" 2>/dev/null || true)" != "$dir/gtfobins" ]; then
     echo "refusing to overwrite $target (not this tool's symlink); remove it first" >&2
