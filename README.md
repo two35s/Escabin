@@ -27,32 +27,48 @@ Use it only on systems you are authorized to assess.
 ## Quick start
 
 ```sh
-git clone https://github.com/two35s/Escabin.git
-cd Escabin
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/two35s/Escabin/main/install.sh | sh
 gtfobins check --ask-sudo
 ```
 
-You can also run it without installing:
-
-```sh
-./gtfobins check
-```
+See [Install](#install) for the inspect-first option, `PATH` notes and the
+clone-based install. From a clone, `./gtfobins check` runs without installing.
 
 If the data file is missing, the first command downloads it to
 `~/.local/share/gtfobins/api.json`.
 
 ## Install
 
-`./install.sh` does four things:
+### One-line install
 
-1. Copies the CLI to `~/.local/share/gtfobins/gtfobins`.
-2. Symlinks it as `~/.local/bin/gtfobins`.
-3. Runs `gtfobins update` to download the latest data (needs network).
-4. Warns if `~/.local/bin` is not in your `PATH`.
+```sh
+curl -fsSL https://raw.githubusercontent.com/two35s/Escabin/main/install.sh | sh
+```
 
-Re-run the installer to upgrade. It refuses to overwrite a `gtfobins` at that
-path that is not its own symlink.
+The script downloads the CLI from this repository, installs it to
+`~/.local/share/gtfobins/gtfobins`, symlinks `~/.local/bin/gtfobins`, and
+refreshes the GTFOBins data. It needs `curl` and network access.
+
+To inspect the installer before running it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/two35s/Escabin/main/install.sh -o /tmp/install.sh
+less /tmp/install.sh
+sh /tmp/install.sh
+```
+
+Make sure `~/.local/bin` is on your `PATH`; the installer warns if it is not.
+
+### From a clone
+
+```sh
+git clone https://github.com/two35s/Escabin.git
+cd Escabin
+./install.sh
+```
+
+Re-run the same command to upgrade (pull first for a clone). The installer
+refuses to overwrite a `gtfobins` at that path that is not its own symlink.
 
 Manual install:
 
@@ -65,6 +81,7 @@ gtfobins update        # optional; the first run downloads data anyway
 ### Requirements
 
 - Python 3.7 or newer.
+- `curl` for the one-line installer.
 - Linux or macOS. Windows is not supported (POSIX permissions and sudo).
 - `find` for the SUID scan.
 - Optional: `sudo` for the sudo scan, `getcap` for Linux capabilities.
