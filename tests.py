@@ -4,10 +4,10 @@
 import importlib.machinery
 import importlib.util
 
-loader = importlib.machinery.SourceFileLoader("gt", "gtfobins")
-spec = importlib.util.spec_from_loader("gt", loader)
-gt = importlib.util.module_from_spec(spec)
-loader.exec_module(gt)
+loader = importlib.machinery.SourceFileLoader("esc", "escabin")
+spec = importlib.util.spec_from_loader("esc", loader)
+esc = importlib.util.module_from_spec(spec)
+loader.exec_module(esc)
 
 # --- sudo -l parsing -------------------------------------------------------
 SAMPLE = """Matching Defaults entries for bob on host:
@@ -18,7 +18,7 @@ User bob may run the following commands on host:
     (root) NOPASSWD: /usr/bin/vim, /usr/bin/systemctl restart nginx
     (root) /usr/bin/find, (ALL) NOPASSWD: /bin/cat
 """
-rules = gt.parse_sudo(SAMPLE)
+rules = esc.parse_sudo(SAMPLE)
 assert len(rules) == 5, rules
 assert rules[0]["all"] and not rules[0]["nopasswd"]
 assert rules[1]["path"] == "/usr/bin/vim" and rules[1]["nopasswd"]
@@ -27,13 +27,13 @@ assert rules[2]["args"] == "restart nginx"
 assert rules[3]["path"] == "/usr/bin/find" and not rules[3]["nopasswd"]
 assert rules[4]["path"] == "/bin/cat" and rules[4]["nopasswd"] and rules[4]["runas"] == "ALL"
 
-assert gt.runas_user({"runas": "www-data : www-data"}) == "www-data"
-assert gt.runas_user({}) == "root"
-assert gt.is_root_runas("ALL") and gt.is_root_runas("root")
-assert not gt.is_root_runas("www-data")
+assert esc.runas_user({"runas": "www-data : www-data"}) == "www-data"
+assert esc.runas_user({}) == "root"
+assert esc.is_root_runas("ALL") and esc.is_root_runas("root")
+assert not esc.is_root_runas("www-data")
 
 # --- command rewriting -----------------------------------------------------
-rw = gt.rewrite_commands
+rw = esc.rewrite_commands
 assert rw("echo x | at now", "at", "/usr/bin/at", "sudo ") == \
     "echo x | sudo /usr/bin/at now"
 assert rw("echo DATA >/f\nmv /f /out", "mv", "/opt/bin/mv") == \
@@ -56,7 +56,7 @@ data = {
     "functions": {},
     "contexts": {},
 }
-db = gt.DB(data)
+db = esc.DB(data)
 assert db.canon("apt") == "apt-get"
 assert db.canon("/usr/bin/python3.11") == "python"
 assert db.canon("gcc-12") == "gcc"
@@ -71,18 +71,18 @@ cap_data = {
     "functions": {},
     "contexts": {},
 }
-cap_db = gt.DB(cap_data)
-key, funcs = gt.matching(cap_db, "/usr/bin/python3", "capabilities", {"cap_setuid"})
+cap_db = esc.DB(cap_data)
+key, funcs = esc.matching(cap_db, "/usr/bin/python3", "capabilities", {"cap_setuid"})
 assert key == "python" and [f for f, _ in funcs] == ["shell"]
-assert gt.matching(cap_db, "/usr/bin/python3", "capabilities", {"cap_net_raw"})[1] == []
+assert esc.matching(cap_db, "/usr/bin/python3", "capabilities", {"cap_net_raw"})[1] == []
 
 # --- root and writable SUID ------------------------------------------------
-assert not gt.writable_by_us(0o4755, 0, True)   # root: access() is always true
-assert gt.writable_by_us(0o4777, 0, False)
-assert gt.writable_by_us(0o4755, 1000, True)
-assert not gt.writable_by_us(0o4755, 1000, False)
+assert not esc.writable_by_us(0o4755, 0, True)   # root: access() is always true
+assert esc.writable_by_us(0o4777, 0, False)
+assert esc.writable_by_us(0o4755, 1000, True)
+assert not esc.writable_by_us(0o4755, 1000, False)
 
 # --- text cleanup ----------------------------------------------------------
-assert gt.clean_md("see [cron](https://x)") == "see cron (https://x)"
+assert esc.clean_md("see [cron](https://x)") == "see cron (https://x)"
 
 print("all tests passed")

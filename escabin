@@ -21,10 +21,10 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1"
+VERSION = "2.0"
 API_URL = "https://gtfobins.org/api.json"
-DATA_DIR = os.environ.get("GTFOBINS_HOME") or os.path.join(
-    os.path.expanduser("~"), ".local", "share", "gtfobins"
+DATA_DIR = os.environ.get("ESCABIN_HOME") or os.path.join(
+    os.path.expanduser("~"), ".local", "share", "escabin"
 )
 API_PATH = os.path.join(DATA_DIR, "api.json")
 
@@ -76,7 +76,7 @@ def green(t):
 
 
 def die(msg):
-    print(f"gtfobins: {msg}", file=sys.stderr)
+    print(f"escabin: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -99,7 +99,7 @@ def system_tool(name):
 
 def download():
     os.makedirs(DATA_DIR, exist_ok=True)
-    req = urllib.request.Request(API_URL, headers={"User-Agent": f"gtfobins/{VERSION}"})
+    req = urllib.request.Request(API_URL, headers={"User-Agent": f"escabin/{VERSION}"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         raw = resp.read()
     data = json.loads(raw)  # refuse to cache garbage
@@ -132,7 +132,7 @@ def load_api(refresh=False):
     with open(API_PATH, encoding="utf-8") as fh:
         data = json.load(fh)
     if not all(k in data for k in ("executables", "functions", "contexts")):
-        die("corrupt data file, run: gtfobins update")
+        die("corrupt data file, run: escabin update")
     return data
 
 
@@ -278,7 +278,7 @@ def print_code(code, indent="    "):
 def cmd_show(db, ref):
     key = db.canon(ref)
     if not key:
-        die(f"'{ref}' not in GTFOBins (try: gtfobins search {ref})")
+        die(f"'{ref}' not in GTFOBins (try: escabin search {ref})")
     entry = db.ex[key]
     print(bold(key))
     if entry.get("alias"):
@@ -368,7 +368,7 @@ def scan_suid(full):
                                   timeout=900 if full else 120, errors="replace")
             return proc.stdout.splitlines(), True
         except subprocess.TimeoutExpired as exc:
-            print(f"gtfobins: warning: scanning {root} timed out, results incomplete",
+            print(f"escabin: warning: scanning {root} timed out, results incomplete",
                   file=sys.stderr)
             out = exc.stdout or ""
             if isinstance(out, bytes):
@@ -640,7 +640,7 @@ def cmd_check(db, full, as_json, ask_sudo=False):
         }, indent=2))
         return
 
-    print(bold("GTFOBins local check") + dim(
+    print(bold("Escabin local check") + dim(
         f"  {sys.platform}  user={pwd.getpwuid(os.getuid()).pw_name}  {elapsed:.1f}s"))
     cap_text = f"{len(caps)} capabilities" if cap_note is None else "capabilities not checked"
     print(dim(f"scanned {len(suid)} SUID binaries, {cap_text}; sudo -l {'ok' if sudo['ok'] else 'unavailable'}"))
@@ -672,7 +672,7 @@ def cmd_check(db, full, as_json, ask_sudo=False):
     for note in notes:
         print(dim("note: " + note))
     print()
-    print(dim("hint: `gtfobins <binary>` shows every documented trick for a binary"))
+    print(dim("hint: `escabin <binary>` shows every documented trick for a binary"))
 
 
 # ---------------------------------------------------------------- cli
@@ -684,10 +684,10 @@ def main():
         argv = ["show"] + argv
 
     parser = argparse.ArgumentParser(
-        prog="gtfobins",
+        prog="escabin",
         description="Offline GTFOBins lookup and local privilege-escalation audit.",
     )
-    parser.add_argument("--version", action="version", version=f"gtfobins {VERSION}")
+    parser.add_argument("--version", action="version", version=f"escabin {VERSION}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_show = sub.add_parser("show", help="show every documented trick for a binary")

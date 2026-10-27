@@ -1,4 +1,4 @@
-# gtfobins
+# escabin
 
 Offline [GTFOBins](https://gtfobins.org) lookup and a fast local privilege-escalation
 audit. One Python file, standard library only.
@@ -28,14 +28,14 @@ Use it only on systems you are authorized to assess.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/two35s/Escabin/main/install.sh | sh
-gtfobins check --ask-sudo
+escabin check --ask-sudo
 ```
 
 See [Install](#install) for the inspect-first option, `PATH` notes and the
-clone-based install. From a clone, `./gtfobins check` runs without installing.
+clone-based install. From a clone, `./escabin check` runs without installing.
 
 If the data file is missing, the first command downloads it to
-`~/.local/share/gtfobins/api.json`.
+`~/.local/share/escabin/api.json`.
 
 ## Install
 
@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/two35s/Escabin/main/install.sh | sh
 ```
 
 The script downloads the CLI from this repository, installs it to
-`~/.local/share/gtfobins/gtfobins`, symlinks `~/.local/bin/gtfobins`, and
+`~/.local/share/escabin/escabin`, symlinks `~/.local/bin/escabin`, and
 refreshes the GTFOBins data. It needs `curl` and network access.
 
 To inspect the installer before running it:
@@ -68,14 +68,15 @@ cd Escabin
 ```
 
 Re-run the same command to upgrade (pull first for a clone). The installer
-refuses to overwrite a `gtfobins` at that path that is not its own symlink.
+refuses to overwrite an existing `escabin` at that path that is not its own
+symlink.
 
 Manual install:
 
 ```sh
 mkdir -p ~/.local/bin
-install -m 755 gtfobins ~/.local/bin/gtfobins
-gtfobins update        # optional; the first run downloads data anyway
+install -m 755 escabin ~/.local/bin/escabin
+escabin update        # optional; the first run downloads data anyway
 ```
 
 ### Requirements
@@ -95,31 +96,31 @@ in the data directory before the first run (see [Data and trust](#data-and-trust
 
 | Command | What it does |
 | --- | --- |
-| `gtfobins show <binary>` | Show every documented trick for one binary. |
-| `gtfobins <binary>` | Shortcut for `show`. |
-| `gtfobins search <term> [-n N]` | Search names, function labels, commands and comments. Default limit: 40. |
-| `gtfobins list` | List every binary in the dataset. |
-| `gtfobins check [options]` | Audit the local machine. |
-| `gtfobins update` | Download fresh data and print its size and SHA-256. |
-| `gtfobins --version` | Print the version. |
+| `escabin show <binary>` | Show every documented trick for one binary. |
+| `escabin <binary>` | Shortcut for `show`. |
+| `escabin search <term> [-n N]` | Search names, function labels, commands and comments. Default limit: 40. |
+| `escabin list` | List every binary in the dataset. |
+| `escabin check [options]` | Audit the local machine. |
+| `escabin update` | Download fresh data and print its size and SHA-256. |
+| `escabin --version` | Print the version. |
 
 `show` accepts a name, a path or a versioned name: `vim`, `/usr/bin/vim`,
 `python3.11`, `/usr/bin/gcc-12`.
 
 ```sh
-gtfobins show vim
-gtfobins show /usr/bin/vim
-gtfobins search 'reverse shell' -n 5
-gtfobins list
+escabin show vim
+escabin show /usr/bin/vim
+escabin search 'reverse shell' -n 5
+escabin list
 ```
 
 ## check
 
 ```sh
-gtfobins check                 # fast scan, non-interactive sudo
-gtfobins check --ask-sudo      # let sudo prompt, so your rules are visible
-gtfobins check --full          # scan the whole filesystem (slow)
-gtfobins check --json          # machine-readable output
+escabin check                 # fast scan, non-interactive sudo
+escabin check --ask-sudo      # let sudo prompt, so your rules are visible
+escabin check --full          # scan the whole filesystem (slow)
+escabin check --json          # machine-readable output
 ```
 
 ### What it scans
@@ -177,8 +178,8 @@ reverse-shell, bind-shell, privilege-escalation, file-read and file-write.
 Trimmed example; your paths and rules will differ.
 
 ```text
-$ gtfobins check --ask-sudo
-GTFOBins local check  linux  user=alice  1.8s
+$ escabin check --ask-sudo
+Escabin local check  linux  user=alice  1.8s
 scanned 41 SUID binaries, 6 capabilities; sudo -l ok
 
 HIGH       sudo /usr/bin/find (NOPASSWD)
@@ -229,7 +230,7 @@ coverage are all included.
 
 ```json
 {
-  "version": "1.1",
+  "version": "2.0",
   "platform": "linux",
   "user": "alice",
   "elapsed": 1.84,
@@ -262,24 +263,24 @@ coverage are all included.
 Optional filtering with `jq`:
 
 ```sh
-gtfobins check --json | jq -r '.findings[] | "\(.severity)\t\(.title)"'
+escabin check --json | jq -r '.findings[] | "\(.severity)\t\(.title)"'
 ```
 
 ## Data and trust
 
 - Data comes from `https://gtfobins.org/api.json` over HTTPS.
-- It is cached at `$GTFOBINS_HOME/api.json`, defaulting to
-  `~/.local/share/gtfobins/api.json`.
+- It is cached at `$ESCABIN_HOME/api.json`, defaulting to
+  `~/.local/share/escabin/api.json`.
 - The JSON is shape-checked before it is written and replaced atomically.
 - `update` prints the file size and SHA-256. The data is **not signed or
   hash-pinned**, so the hash is for comparison, not verification.
-- For a trusted or offline copy, put an `api.json` in `GTFOBINS_HOME` and do not
+- For a trusted or offline copy, put an `api.json` in `ESCABIN_HOME` and do not
   run `update`:
 
 ```sh
-mkdir -p ~/.gtfobins-data
-cp /path/to/trusted/api.json ~/.gtfobins-data/api.json
-GTFOBINS_HOME=~/.gtfobins-data gtfobins check
+mkdir -p ~/.escabin-data
+cp /path/to/trusted/api.json ~/.escabin-data/api.json
+ESCABIN_HOME=~/.escabin-data escabin check
 ```
 
 Other environment variables:
@@ -312,19 +313,19 @@ Other environment variables:
 ## Uninstall
 
 ```sh
-rm -f ~/.local/bin/gtfobins
-rm -rf ~/.local/share/gtfobins
+rm -f ~/.local/bin/escabin
+rm -rf ~/.local/share/escabin
 ```
 
-If you set `GTFOBINS_HOME`, remove that directory instead of the default one.
+If you set `ESCABIN_HOME`, remove that directory instead of the default one.
 
 ## Development
 
-The tool is deliberately one stdlib-only file (`gtfobins`). There is no build
+The tool is deliberately one stdlib-only file (`escabin`). There is no build
 step.
 
 ```sh
-python3 -m py_compile gtfobins
+python3 -m py_compile escabin
 python3 tests.py
 ```
 
@@ -335,5 +336,5 @@ logic and markdown cleanup.
 ## Credits
 
 Data and snippets come from the [GTFOBins](https://gtfobins.org) project
-([source](https://github.com/GTFOBins/GTFOBins.github.io)). This tool is not
+([source](https://github.com/GTFOBins/GTFOBins.github.io)). Escabin is not
 affiliated with GTFOBins.
